@@ -11,9 +11,8 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from pymongo import MongoClient
 
@@ -69,10 +68,17 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
+    try:
+        db.command("ping")
+        return {"status": "ok"}
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB unavailable"
+        )
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
