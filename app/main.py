@@ -11,6 +11,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from datetime import timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -29,8 +30,16 @@ IST = timezone(timedelta(hours=5, minutes=30))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Create database indexes before accepting requests.
+
+    # 1. Ensure employee codes are unique
     db.employees.create_index(
         [("emp_code", 1)],
+        unique=True,
+    )
+
+    # 2. Ensure one attendance record per employee per date
+    db.attendance_logs.create_index(
+        [("emp_code", 1), ("date", 1)],
         unique=True,
     )
 
@@ -156,18 +165,66 @@ def list_employees(
 
 
 
+from pymongo.errors import DuplicateKeyError
+
+
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
+    # 1. Validate that the employee exists
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # 2. Convert the timestamp to IST
+    if body.punched_at is not None:
+        if (
+            isinstance(body.punched_at, bool)
+            or not isinstance(body.punched_at, int)
+            or body.punched_at < 100_000_000_000
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="punched_at must be an epoch-millisecond integer",
+            )
+
+        try:
+            ts = datetime.fromtimestamp(
+                body.punched_at / 1000,
+                tz=timezone.utc,
+            ).astimezone(IST)
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid punched_at timestamp",
+            )
+    else:
+        ts = datetime.now(IST)
+
+    # 3. Truncate to whole seconds
+    ts = ts.replace(microsecond=0)
+    attendance_day = ts.date()
+
+    shift_start = datetime.strptime(
+        emp["shift_start"], "%H:%M"
+    ).time()
+
+    shift_end = datetime.strptime(
+        emp["shift_end"], "%H:%M"
+    ).time()
+
+    # If this is an overnight shift and punch-in is
+    # before the shift's end time, use the previous date.
+    if shift_end <= shift_start and ts.time() < shift_end:
+        attendance_day -= timedelta(days=1)
+
+    attendance_date = attendance_day.isoformat()
+
+    # 4. Build the attendance record
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": attendance_date,
         "status": body.status,
-        "punch_in": ts,
+        "punch_in": ts.astimezone(timezone.utc).replace(tzinfo=None),
         "punch_out": None,
         "work_hours": None,
         "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
@@ -175,9 +232,21 @@ def punch_in(body: PunchInIn):
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
+
+    # 5. Insert atomically; the unique index prevents duplicate records
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="Already punched in for this date",
+        )
+
+    # 6. Prepare the API response
     doc.pop("_id", None)
+    doc["punch_in"] = int(ts.timestamp() * 1000)
+    doc["punch_out"] = None
+
     return doc
 
 
