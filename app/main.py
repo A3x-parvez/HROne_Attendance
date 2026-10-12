@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -23,7 +25,23 @@ db = client[os.getenv("MONGO_DB")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create database indexes before accepting requests.
+    db.employees.create_index(
+        [("emp_code", 1)],
+        unique=True,
+    )
+
+    yield
+
+
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -80,15 +98,30 @@ def health():
             detail="MongoDB unavailable"
         )
 
+
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+    doc["created_at"] = datetime.now(timezone.utc)
+
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="emp_code already exists",
+        )
+
     doc.pop("_id", None)
+    # doc["_id"] = str(doc["_id"])
+
+    # The API contract requires epoch milliseconds.
+    doc["created_at"] = int(
+        doc["created_at"].timestamp() * 1000
+    )
+
     return doc
+
 
 
 
