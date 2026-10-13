@@ -58,8 +58,21 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
+
+    start = punch_in.replace(
+        hour=h,
+        minute=m,
+        second=0,
+        microsecond=0,
+    )
+
+    # For an overnight shift, an after-midnight punch-in
+    # may belong to the previous day's shift.
+    if punch_in.time() < start.time():
+        start -= timedelta(days=1)
+
+    minutes = int((punch_in - start).total_seconds() // 60)
+
     return minutes if minutes > 10 else 0
 
 
