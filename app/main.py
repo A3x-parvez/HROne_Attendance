@@ -18,6 +18,8 @@ from pydantic import BaseModel
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from contextlib import asynccontextmanager
+from decimal import Decimal, ROUND_HALF_UP
+
 
 load_dotenv()
 
@@ -77,13 +79,36 @@ def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    seconds = Decimal(str((punch_out - punch_in).total_seconds()))
+    hours = (seconds / Decimal("3600")).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+    return float(hours)
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+
+def compute_overtime(
+    punch_out: datetime,
+    shift_start: str,
+    shift_end: str,
+    date_str: str,
+) -> int:
+    start_time = datetime.strptime(shift_start, "%H:%M").time()
+    end_time = datetime.strptime(shift_end, "%H:%M").time()
+
+    shift_date = datetime.fromisoformat(date_str).date()
+    end_date = shift_date
+
+    # An overnight shift ends on the following calendar day.
+    if end_time <= start_time:
+        end_date += timedelta(days=1)
+
+    scheduled_end = datetime.combine(end_date, end_time, tzinfo=IST)
+    minutes = int((punch_out - scheduled_end).total_seconds() // 60)
+
+    # Overtime is counted only when it reaches 30 minutes.
+    return minutes if minutes >= 30 else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +128,10 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
     status: str = "PRESENT"
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -176,9 +205,6 @@ def list_employees(
         "page_size": page_size,
     }
 
-
-
-from pymongo.errors import DuplicateKeyError
 
 
 @app.post("/attendance/punch-in", status_code=201)
@@ -262,6 +288,132 @@ def punch_in(body: PunchInIn):
 
     return doc
 
+
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutIn):
+    # 1. Verify the employee exists.
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # 2. Convert the requested punch-out time to IST.
+    if body.punched_at is not None:
+        if (
+            isinstance(body.punched_at, bool)
+            or not isinstance(body.punched_at, int)
+            or body.punched_at < 100_000_000_000
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="punched_at must be an epoch-millisecond integer",
+            )
+
+        try:
+            ts = datetime.fromtimestamp(
+                body.punched_at / 1000,
+                tz=timezone.utc,
+            ).astimezone(IST)
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid punched_at timestamp",
+            )
+    else:
+        ts = datetime.now(IST)
+
+    # 3. Truncate to whole seconds.
+    ts = ts.replace(microsecond=0)
+
+    # MongoDB stores attendance datetimes as naive UTC.
+    punch_out_utc = ts.astimezone(timezone.utc).replace(tzinfo=None)
+
+    # 4. Find the most recent punch-in at or before this time.
+    record = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$lte": punch_out_utc},
+        },
+        sort=[("punch_in", -1)],
+    )
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No punch-in found before this time",
+        )
+
+    # 5. A closed record cannot be punched out again.
+    if record.get("punch_out") is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance already punched out",
+        )
+
+    punch_in_utc = record["punch_in"].replace(tzinfo=timezone.utc)
+    punch_in_ist = punch_in_utc.astimezone(IST)
+
+    # 6. Validate the punch-out interval.
+    elapsed = punch_out_utc - record["punch_in"]
+
+    if elapsed.total_seconds() <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out must be after punch-in",
+        )
+
+    if elapsed > timedelta(hours=24):
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be more than 24 hours after punch-in",
+        )
+
+    # 7. Compute the derived fields.
+    work_hours = compute_work_hours(punch_in_ist, ts)
+
+    overtime_minutes = compute_overtime(
+        ts,
+        emp["shift_start"],
+        emp["shift_end"],
+        record["date"],
+    )
+
+    half_day = work_hours < 4.50
+
+    # 8. Atomically close the record.
+    # Only one concurrent request can update this open record.
+    result = db.attendance_logs.update_one(
+        {
+            "_id": record["_id"],
+            "punch_out": None,
+        },
+        {
+            "$set": {
+                "punch_out": punch_out_utc,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day,
+            }
+        },
+    )
+
+    if result.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance was already punched out",
+        )
+
+    # 9. Return the updated record without MongoDB's internal _id.
+    updated = db.attendance_logs.find_one({"_id": record["_id"]})
+    updated.pop("_id", None)
+
+    updated["punch_in"] = int(
+        punch_in_utc.timestamp() * 1000
+    )
+    updated["punch_out"] = int(
+        punch_out_utc.replace(tzinfo=timezone.utc).timestamp() * 1000
+    )
+
+    return updated
 
 @app.get("/attendance")
 def list_attendance(
