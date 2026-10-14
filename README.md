@@ -21,6 +21,21 @@ uvicorn app.main:app --port 8000 --reload
 ```
 MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
 
+## API coverage
+
+The FastAPI app implements the paths and response shapes in `openapi.yaml`, including:
+
+- Employee creation and listing.
+- Attendance punch-in, punch-out, listing, and audited regularization.
+- Employee monthly analytics, department summaries, the late leaderboard, and daily department trends.
+- MongoDB execution plans at `/admin/explain/{endpoint}` for the five supported endpoint names.
+
+Analytics are aggregated in MongoDB. The department trend uses `$densify` and a seven-row window so dates with no
+attendance records are still returned. Startup creates unique employee and attendance keys plus date and department
+indexes for the filtered queries and aggregations. The explain endpoint runs the corresponding query or aggregation with
+`executionStats` verbosity.
+
 ## Submit
+
 A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
 No `.env`, no secrets, no Dockerfile.
