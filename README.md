@@ -33,7 +33,10 @@ The FastAPI app implements the paths and response shapes in `openapi.yaml`, incl
 Analytics are aggregated in MongoDB. The department trend uses `$densify` and a seven-row window so dates with no
 attendance records are still returned. Startup creates unique employee and attendance keys plus date and department
 indexes for the filtered queries and aggregations. The explain endpoint runs the corresponding query or aggregation with
-`executionStats` verbosity.
+`executionStats` verbosity. Employee inputs follow the OpenAPI constraints; timestamp inputs are strict epoch-millisecond
+integers within the documented range, and attendance percentages use four-decimal half-up rounding.
+
+Run the focused regression suite with `python -m unittest discover -s tests -v`.
 
 ## Submit
 
