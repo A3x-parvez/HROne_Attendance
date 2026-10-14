@@ -10,7 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Literal
 from datetime import timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -58,32 +58,69 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
 
-    start = punch_in.replace(
-        hour=h,
-        minute=m,
-        second=0,
-        microsecond=0,
+
+
+def serialize_mongo_datetimes(value):
+    """Convert MongoDB datetimes to epoch milliseconds recursively."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(value.timestamp() * 1000)
+
+    if isinstance(value, dict):
+        return {
+            key: serialize_mongo_datetimes(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [serialize_mongo_datetimes(item) for item in value]
+
+    return value
+
+
+
+def compute_late_minutes(
+    punch_in: datetime,
+    shift_start: str,
+    attendance_date: str,
+) -> int:
+    # Build the scheduled start time for this attendance date.
+    start_time = datetime.strptime(shift_start, "%H:%M").time()
+    shift_date = datetime.fromisoformat(attendance_date).date()
+
+    scheduled_start = datetime.combine(
+        shift_date,
+        start_time,
+        tzinfo=punch_in.tzinfo,
     )
 
-    # For an overnight shift, an after-midnight punch-in
-    # may belong to the previous day's shift.
-    if punch_in.time() < start.time():
-        start -= timedelta(days=1)
+    # Calculate seconds late, including seconds within a minute.
+    elapsed_seconds = (punch_in - scheduled_start).total_seconds()
 
-    minutes = int((punch_in - start).total_seconds() // 60)
+    # Grace period: exactly 10 minutes late is not considered late.
+    if elapsed_seconds <= 600:
+        return 0
 
-    return minutes if minutes > 10 else 0
+    # Return whole minutes since scheduled shift start.
+    return int(elapsed_seconds // 60)
 
 
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    seconds = Decimal(str((punch_out - punch_in).total_seconds()))
+
+def compute_work_hours(
+    punch_in: datetime,
+    punch_out: datetime,
+) -> float:
+    seconds = Decimal(
+        str((punch_out - punch_in).total_seconds())
+    )
+
     hours = (seconds / Decimal("3600")).quantize(
         Decimal("0.01"),
         rounding=ROUND_HALF_UP,
     )
+
     return float(hours)
 
 
@@ -127,7 +164,8 @@ class EmployeeIn(BaseModel):
 class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
 
 class PunchOutIn(BaseModel):
     emp_code: str
@@ -266,7 +304,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts.astimezone(timezone.utc).replace(tzinfo=None),
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"],attendance_date,),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
@@ -415,34 +453,85 @@ def punch_out(body: PunchOutIn):
 
     return updated
 
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    status: Optional[
+        Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
+    ] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    # Validate dates and require YYYY-MM-DD format.
+    parsed_from = None
+    parsed_to = None
 
+    try:
+        if date_from is not None:
+            parsed_from = datetime.strptime(date_from, "%Y-%m-%d").date()
+            if parsed_from.isoformat() != date_from:
+                raise ValueError("Invalid date format")
+
+        if date_to is not None:
+            parsed_to = datetime.strptime(date_to, "%Y-%m-%d").date()
+            if parsed_to.isoformat() != date_to:
+                raise ValueError("Invalid date format")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Dates must use YYYY-MM-DD format",
+        )
+
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from must be on or before date_to",
+        )
+
+    # Build MongoDB filters.
+    query = {}
+
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+
+    if parsed_from or parsed_to:
+        date_filter = {}
+
+        if parsed_from:
+            date_filter["$gte"] = parsed_from.isoformat()
+
+        if parsed_to:
+            date_filter["$lte"] = parsed_to.isoformat()
+
+        query["date"] = date_filter
+
+    if status is not None:
+        query["status"] = status
+
+    # Count and paginate in MongoDB, not in Python.
+    total = db.attendance_logs.count_documents(query)
+
+    cursor = (
+        db.attendance_logs.find(query, {"_id": 0})
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    items = [
+        serialize_mongo_datetimes(record)
+        for record in cursor
+    ]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
