@@ -1,6 +1,8 @@
-# REVIEW.md
+# Starter code review
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+I reviewed the starter `app/main.py` against the assignment's OpenAPI contract, data model, and R1–R10 business rules.
+The table lists the contract-facing defects I identified, how they would show up, and the corresponding changes in this
+submission.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
@@ -16,12 +18,11 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 | 10 | `department_summary` month parsing | December of year 9999 overflowed while constructing the next month, producing an unhandled error. | Requesting `month=9999-12` raised a server error. | Use the shared strict month parser, which converts unrepresentable next-month boundaries into HTTP 422. |
 | 11 | Employee and attendance response serialization | Employee-list `created_at` was a BSON datetime and the sample legacy attendance record omitted schema-required fields; punch-out did not serialize existing history timestamps. | Responses contained ISO datetime strings or omitted required attendance fields. | Serialize BSON instants to epoch milliseconds, strip `_id`, and supply contract defaults for absent legacy attendance fields. |
 
-Also note anything you looked at and decided was **not** a defect, and why.
+## Checked and not considered defects
 
-The existing department summary route was already present, so it was retained rather than reimplemented. Its equivalent
-aggregation builder is also used by the explain route. This change addresses the missing routes; it is not a line-by-line
-audit of unrelated starter code.
-
-The late-arrival, overtime, overnight-shift, and half-day calculation helpers already followed their stated thresholds and
-were retained. The provided sample documents are valid examples, not a complete analytics test set: monthly and trend
-results must also honor weekends, join dates, employees with no logs, and records outside the shown sample.
+- The single-file layout is an assignment requirement, not an architectural defect; implementation remains in
+  `app/main.py`.
+- BSON datetimes in MongoDB with epoch-millisecond values at the HTTP boundary are required by the data model and API
+  contract, not a defect.
+- The provided sample documents are valid examples, but they are not a complete analytics test set. The implementation
+  also accounts for weekends, join dates, employees with no logs, ties, and date gaps described by the contract.

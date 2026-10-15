@@ -1,44 +1,56 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+This repository is my submission for the HROne Software Engineer Trainee assignment. It implements the attendance API
+and analytics described in `openapi.yaml`, using FastAPI and MongoDB. The goal is to keep attendance records consistent,
+apply the specified business rules, preserve a correction audit trail, and return the required reports from MongoDB.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## What the API solves
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+- Creates and lists employees using the customer-supplied `emp_code`.
+- Records punch-in and punch-out, including supported statuses, duplicate protection, IST attendance dates, overnight
+  shifts, and server-computed late, overtime, work-hour, and half-day values.
+- Lists and filters attendance records, and supports manual corrections with an append-only history of changed fields.
+- Provides employee monthly summaries, department monthly summaries, a late-arrival leaderboard, and a gap-filled daily
+  department trend.
+- Provides execution statistics for the supported endpoint queries through `/admin/explain/{endpoint}`.
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
+Timestamps at the API boundary use epoch milliseconds. MongoDB stores instants as BSON dates and calendar dates as
+`YYYY-MM-DD` strings. Analytics read stored derived attendance values, include employees with no logs in headcount, and
+apply the assignment's weekday, rounding, tie-ranking, and date-range rules.
+
+## Run locally
+
+Use Python 3.11 or newer and MongoDB 6.0 or newer. Install dependencies and set `MONGO_URI` and `MONGO_DB` in the
+environment before starting the service. Do not commit `.env` files or database credentials.
+
+PowerShell example (replace the URI with your own local or Atlas connection string):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+$env:MONGO_URI = "mongodb://localhost:27017"
+$env:MONGO_DB = "attendance_db"
 python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
+uvicorn app.main:app --port 8000
 ```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
 
-## API coverage
+For Bash, activate with `source .venv/bin/activate` and export the same two environment variables. The sample seed
+replaces documents in the configured collections; use it only with a disposable development database.
 
-The FastAPI app implements the paths and response shapes in `openapi.yaml`, including:
+Run the regression tests with:
 
-- Employee creation and listing.
-- Attendance punch-in, punch-out, listing, and audited regularization.
-- Employee monthly analytics, department summaries, the late leaderboard, and daily department trends.
-- MongoDB execution plans at `/admin/explain/{endpoint}` for the five supported endpoint names.
+```powershell
+python -m unittest discover -s tests -v
+```
 
-Analytics are aggregated in MongoDB. The department trend uses `$densify` and a seven-row window so dates with no
-attendance records are still returned. Startup creates unique employee and attendance keys plus date and department
-indexes for the filtered queries and aggregations. The explain endpoint runs the corresponding query or aggregation with
-`executionStats` verbosity. Employee inputs follow the OpenAPI constraints; timestamp inputs are strict epoch-millisecond
-integers within the documented range, and attendance percentages use four-decimal half-up rounding.
+## Files
 
-Run the focused regression suite with `python -m unittest discover -s tests -v`.
+- `app/main.py` — API routes, validation, attendance rules, MongoDB pipelines, indexes, and explain support.
+- `openapi.yaml` — HTTP contract and rules R1–R10.
+- `DATA_MODEL.md` and `sample_data/` — MongoDB schema and sample records.
+- `REVIEW.md` — defects identified in the starter and the corresponding fixes.
+- `DECISIONS.md` — implementation choices and their trade-offs.
 
-## Submit
-
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+The implementation was tested with the local regression suite. A live MongoDB integration run is still needed to verify
+the pipelines and explain plans against a MongoDB 6+ server and a production-sized dataset.
