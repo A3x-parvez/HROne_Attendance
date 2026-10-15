@@ -1,29 +1,52 @@
 # Employee Attendance & Analytics API
 
-This repository is my submission for the HROne Software Engineer Trainee assignment. It implements the attendance API
-and analytics described in `openapi.yaml`, using FastAPI and MongoDB. The goal is to keep attendance records consistent,
-apply the specified business rules, preserve a correction audit trail, and return the required reports from MongoDB.
+FastAPI service for employee attendance, manual corrections, and MongoDB-backed reporting. It follows the endpoints,
+response shapes, and attendance rules in [`openapi.yaml`](openapi.yaml).
 
-## What the API solves
+## Features
 
-- Creates and lists employees using the customer-supplied `emp_code`.
-- Records punch-in and punch-out, including supported statuses, duplicate protection, IST attendance dates, overnight
-  shifts, and server-computed late, overtime, work-hour, and half-day values.
-- Lists and filters attendance records, and supports manual corrections with an append-only history of changed fields.
-- Provides employee monthly summaries, department monthly summaries, a late-arrival leaderboard, and a gap-filled daily
-  department trend.
-- Provides execution statistics for the supported endpoint queries through `/admin/explain/{endpoint}`.
+- Create and list employees.
+- Punch in and out; calculate attendance dates in IST and store derived late, overtime, work-hour, and half-day values.
+- List attendance and regularize records with an audit history of changed fields.
+- Report monthly employee and department attendance, rank late arrivals, and return a gap-filled daily department trend.
+- Inspect MongoDB execution statistics for the supported endpoint queries.
 
-Timestamps at the API boundary use epoch milliseconds. MongoDB stores instants as BSON dates and calendar dates as
-`YYYY-MM-DD` strings. Analytics read stored derived attendance values, include employees with no logs in headcount, and
-apply the assignment's weekday, rounding, tie-ranking, and date-range rules.
+Instants cross the API boundary as epoch milliseconds and are stored in MongoDB as BSON dates. Analytics use the stored
+derived attendance values and MongoDB aggregation pipelines.
 
-## Run locally
+## Implementation changes
 
-Use Python 3.11 or newer and MongoDB 6.0 or newer. Install dependencies and set `MONGO_URI` and `MONGO_DB` in the
-environment before starting the service. Do not commit `.env` files or database credentials.
+The main implementation is in `app/main.py`, as required by the assignment. It includes:
 
-PowerShell example (replace the URI with your own local or Atlas connection string):
+- The contract routes:
+  - System and employees: `GET /health`, `POST /employees`, `GET /employees`.
+  - Attendance: `POST /attendance/punch-in`, `POST /attendance/punch-out`, `GET /attendance`, and
+    `PATCH /attendance/{emp_code}/{date}`.
+  - Analytics: `GET /analytics/employees/{emp_code}/monthly`, `GET /analytics/departments/summary`,
+    `GET /analytics/leaderboard/late`, and `GET /analytics/departments/{department}/trend`.
+  - Query plans: `GET /admin/explain/{endpoint}`.
+- Pydantic request models for employee creation, punch-in, punch-out, and regularization. Employee codes, departments,
+  names, email, shift times, dates, and epoch-millisecond timestamps are validated at the request boundary.
+- IST attendance-date handling, including assigning early-morning punches on overnight shifts to the preceding shift
+  date. Punch instants are truncated to whole seconds before storage and response.
+- Server calculations for the strict 10-minute lateness grace period, the 30-minute overtime threshold, work-hour
+  half-up rounding, and half-day status based on rounded hours.
+- Duplicate protection through unique MongoDB indexes. Punch-out updates only an open record, while regularization
+  validates the corrected status and times, recomputes derived values, and appends an audit entry for fields that
+  changed.
+- API serialization that hides MongoDB `_id`, converts stored BSON datetimes to epoch milliseconds, and supplies
+  contract defaults for optional legacy attendance fields.
+- MongoDB aggregation pipelines for employee monthly metrics, department summaries, the late leaderboard, and the
+  gap-filled department trend. They include join-date working-day/headcount rules, stored derived metrics, competition
+  ranking, daily rows without logs, and the required rounding.
+- Startup index creation for unique employee codes, unique employee/date attendance records, attendance date ordering,
+  and employee join-date/department filters. The explain endpoint uses these endpoint query or pipeline builders and
+  requests `executionStats`.
+
+## Requirements and setup
+
+The stack is Python, FastAPI, Pydantic, PyMongo, and MongoDB. Python 3.11 or newer and MongoDB 6.0 or newer are
+required. From PowerShell in the `candidate_kit` directory:
 
 ```powershell
 python -m venv .venv
@@ -31,12 +54,22 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 $env:MONGO_URI = "mongodb://localhost:27017"
 $env:MONGO_DB = "attendance_db"
+```
+
+Set these environment variables to your own MongoDB connection and database. Alternatively, the app loads them from a
+local `.env`; do not include `.env` or credentials in the submission.
+
+To load the provided sample records and start the API:
+
+```powershell
 python sample_seed.py
 uvicorn app.main:app --port 8000
 ```
 
-For Bash, activate with `source .venv/bin/activate` and export the same two environment variables. The sample seed
-replaces documents in the configured collections; use it only with a disposable development database.
+**Warning:** `sample_seed.py` deletes and replaces documents in both configured collections. Use only a disposable
+development database. When the API is running, its interactive documentation is at <http://localhost:8000/docs>.
+
+## Tests
 
 Run the regression tests with:
 
@@ -44,13 +77,19 @@ Run the regression tests with:
 python -m unittest discover -s tests -v
 ```
 
-## Files
+Latest run in this workspace: 22 tests passed and one failed in
+`test_regularization_handles_legacy_history_and_tracks_only_changes`. Its test double keeps the persisted history time
+as a Python `datetime`, while the API response serializer returns the contract-required epoch-millisecond integer; the
+assertion compares those two representations directly.
 
-- `app/main.py` — API routes, validation, attendance rules, MongoDB pipelines, indexes, and explain support.
-- `openapi.yaml` — HTTP contract and rules R1–R10.
-- `DATA_MODEL.md` and `sample_data/` — MongoDB schema and sample records.
-- `REVIEW.md` — defects identified in the starter and the corresponding fixes.
-- `DECISIONS.md` — implementation choices and their trade-offs.
+## Project files
 
-The implementation was tested with the local regression suite. A live MongoDB integration run is still needed to verify
-the pipelines and explain plans against a MongoDB 6+ server and a production-sized dataset.
+- `app/main.py` — API routes, validation, attendance calculations, aggregation pipelines, and startup indexes.
+- `requirements.txt` — Python dependencies.
+- `openapi.yaml` — API contract and business rules R1–R10.
+- `DATA_MODEL.md`, `sample_data/`, and `sample_seed.py` — MongoDB schema, examples, and sample loader.
+- `REVIEW.md` — review of defects in the original starter and the implemented corrections.
+- `DECISIONS.md` — answers to the five design questions in the assignment.
+
+The regression tests exercise application logic without a live MongoDB server. I have not independently verified the
+aggregation pipelines or explain plans against MongoDB in this workspace.

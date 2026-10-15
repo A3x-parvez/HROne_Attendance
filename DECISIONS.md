@@ -1,15 +1,14 @@
-# DECISIONS.md
+# Design decisions
 
-1. **Indexes.** The unique `employees.emp_code` index keeps employee codes unique. The unique `(emp_code, date)` attendance
-   index both prevents duplicate daily records and supports employee/date lookups. `(date DESC, emp_code ASC)` supports
-   attendance listing and month-wide log scans. `joined_on` and `(department, joined_on)` support headcount filters.
-   I did not add an index on `status`: it has few values, and the date-led index already narrows the common list query
-   without the extra write cost.
-2. **Punch-in race.** Both requests can pass the employee lookup, but they insert the same `(emp_code, date)`. MongoDB's
-   unique index admits one insert; the other raises `DuplicateKeyError`, which the route returns as 409.
-3. **Ties.** The leaderboard uses MongoDB competition ranking, then filters on `rank <= limit`. Employees tied at the
-   cutoff are all returned, and the next rank is skipped.
-4. **Headcount.** Department summary starts with employees who joined by month end and looks up logs. Employees with no
-   matching logs remain in the pipeline with zero-valued stats, so they still contribute to headcount.
-5. **100x data.** I would measure the explain plans first, then consider precomputed monthly rollups and archival policies
-   if the live aggregations no longer meet latency targets.
+1. **Indexes.** Unique `employees.emp_code` and `attendance_logs(emp_code, date)` indexes enforce employee identity and
+   one attendance record per employee per day. The latter supports employee/date lookups. `(date DESC, emp_code ASC)`
+   supports attendance listing; employee `joined_on` and `(department, joined_on)` support headcount filters. I skipped
+   a `status` index because it has few values and adds write cost.
+2. **Punch-in race.** Concurrent requests for the same employee and attendance date may both reach insertion. The unique
+   attendance index allows one insert; MongoDB rejects the other, and the route returns 409 for `DuplicateKeyError`.
+3. **Ties.** The leaderboard uses competition ranks and sorts ties by `emp_code`. If a tie reaches the `limit` rank, all
+   employees in that tie are returned; the next rank is skipped.
+4. **Headcount.** Department summary starts from employees who joined by month end, then looks up their logs. Employees
+   with no logs remain in the aggregation and count toward headcount.
+5. **At 100x data.** I would inspect real execution plans and measure latency first. If monthly reports become too costly,
+   I would consider precomputed rollups, weighing their faster reads against the extra update and consistency work.
